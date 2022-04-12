@@ -56,6 +56,7 @@ foreach_dma_channel! {
 
             unsafe fn start_write<W: Word>(&mut self, _request: Request, buf: *const[W], reg_addr: *mut W, options: TransferOptions) {
                 let (ptr, len) = super::slice_ptr_parts(buf);
+                assert!(len > 0 && len <= 0xFFFF);
                 low_level_api::start_transfer(
                     pac::$dma_peri,
                     $channel_num,
@@ -98,6 +99,7 @@ foreach_dma_channel! {
 
             unsafe fn start_read<W: Word>(&mut self, _request: Request, reg_addr: *const W, buf: *mut [W], options: TransferOptions) {
                 let (ptr, len) = super::slice_ptr_parts_mut(buf);
+                assert!(len > 0 && len <= 0xFFFF);
                 low_level_api::start_transfer(
                     pac::$dma_peri,
                     $channel_num,
@@ -117,29 +119,34 @@ foreach_dma_channel! {
                 );
             }
 
-            unsafe fn start_double_buffered_read<W: super::Word>(
-                &mut self,
-                _request: Request,
-                _reg_addr: *const W,
-                _buffer0: *mut W,
-                _buffer1: *mut W,
-                _buffer_len: usize,
-                _options: TransferOptions,
-            ) {
+            #[cfg(feature = "dcmi-giant-transfer")]
+            unsafe fn start_giant_read<W: Word>(&mut self, _request: Request, _reg_addr: *const W, _buf: *mut [W], _options: TransferOptions) {
                 panic!("Unsafe double buffered mode is unavailable on BDMA");
             }
 
-            unsafe fn set_buffer0<W: super::Word>(&mut self, _buffer: *mut W)  {
-                panic!("Unsafe double buffered mode is unavailable on BDMA");
-            }
+            // unsafe fn start_double_buffered_read<W: super::Word>(
+            //     &mut self,
+            //     _request: Request,
+            //     _reg_addr: *const W,
+            //     _buffer0: *mut W,
+            //     _buffer1: *mut W,
+            //     _buffer_len: usize,
+            //     _options: TransferOptions,
+            // ) {
+            //     panic!("Unsafe double buffered mode is unavailable on BDMA");
+            // }
 
-            unsafe fn set_buffer1<W: super::Word>(&mut self, _buffer: *mut W) {
-                panic!("Unsafe double buffered mode is unavailable on BDMA");
-            }
+            // unsafe fn set_buffer0<W: super::Word>(&mut self, _buffer: *mut W)  {
+            //     panic!("Unsafe double buffered mode is unavailable on BDMA");
+            // }
 
-            unsafe fn is_buffer0_accessible(&mut self) -> bool {
-                panic!("Unsafe double buffered mode is unavailable on BDMA");
-            }
+            // unsafe fn set_buffer1<W: super::Word>(&mut self, _buffer: *mut W) {
+            //     panic!("Unsafe double buffered mode is unavailable on BDMA");
+            // }
+
+            // unsafe fn is_buffer0_accessible(&mut self) -> bool {
+            //     panic!("Unsafe double buffered mode is unavailable on BDMA");
+            // }
 
             fn request_stop(&mut self){
                 unsafe {low_level_api::request_stop(pac::$dma_peri, $channel_num);}
@@ -148,7 +155,7 @@ foreach_dma_channel! {
             fn is_running(&self) -> bool {
                 unsafe {low_level_api::is_running(pac::$dma_peri, $channel_num)}
             }
-            fn remaining_transfers(&mut self) -> u16 {
+            fn remaining_transfers(&mut self) -> u32 {
                 unsafe {low_level_api::get_remaining_transfers(pac::$dma_peri, $channel_num)}
             }
 
@@ -241,11 +248,11 @@ mod low_level_api {
 
     /// Gets the total remaining transfers for the channel
     /// Note: this will be zero for transfers that completed without cancellation.
-    pub unsafe fn get_remaining_transfers(dma: pac::bdma::Dma, ch: u8) -> u16 {
+    pub unsafe fn get_remaining_transfers(dma: pac::bdma::Dma, ch: u8) -> u32 {
         // get a handle on the channel itself
         let ch = dma.ch(ch as _);
         // read the remaining transfer count. If this is zero, the transfer completed fully.
-        ch.ndtr().read().ndt() as u16
+        ch.ndtr().read().ndt() as u32
     }
 
     /// Sets the waker for the specified DMA channel
