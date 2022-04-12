@@ -77,24 +77,14 @@ pub(crate) mod sealed {
             options: TransferOptions,
         );
 
-        /// DMA double-buffered mode is unsafe as UB can happen when the hardware writes to a buffer currently owned by the software
-        /// more information can be found here: https://github.com/embassy-rs/embassy/issues/702
-        /// This feature is now used solely for the purposes of implementing giant DMA transfers required for DCMI
-        unsafe fn start_double_buffered_read<W: super::Word>(
+        #[cfg(feature = "dcmi-giant-transfer")]
+        unsafe fn start_giant_read<W: super::Word>(
             &mut self,
             request: Request,
             reg_addr: *const W,
-            buffer0: *mut W,
-            buffer1: *mut W,
-            buffer_len: usize,
+            buf: *mut [W],
             options: TransferOptions,
         );
-
-        unsafe fn set_buffer0<W: super::Word>(&mut self, buffer: *mut W);
-
-        unsafe fn set_buffer1<W: super::Word>(&mut self, buffer: *mut W);
-
-        unsafe fn is_buffer0_accessible(&mut self) -> bool;
 
         /// Requests the channel to stop.
         /// NOTE: The channel does not immediately stop, you have to wait
@@ -107,7 +97,7 @@ pub(crate) mod sealed {
         fn is_running(&self) -> bool;
 
         /// Returns the total number of remaining transfers.
-        fn remaining_transfers(&mut self) -> u16;
+        fn remaining_transfers(&mut self) -> u32;
 
         /// Sets the waker that is called when this channel stops (either completed or manually stopped)
         fn set_waker(&mut self, waker: &Waker);
@@ -119,8 +109,6 @@ pub(crate) mod sealed {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum WordSize {
     OneByte,
     TwoBytes,
@@ -217,10 +205,20 @@ mod transfers {
         reg_addr: *mut W,
         buf: &'a mut [W],
     ) -> impl Future<Output = ()> + 'a {
-        assert!(buf.len() > 0 && buf.len() <= 0xFFFF);
+        assert!(!buf.is_empty());
         into_ref!(channel);
 
-        unsafe { channel.start_read::<W>(request, reg_addr, buf, Default::default()) };
+        if buf.len() > 0xffff {
+            #[cfg(feature = "dcmi-giant-transfer")]
+            {
+                warn!("Starting giant DMA transfer (> 0xffff), this should be used only for DCMI!");
+                unsafe { channel.start_giant_read::<W>(request, reg_addr, buf, Default::default()) };
+            }
+            #[cfg(not(feature = "dcmi-giant-transfer"))]
+            panic!("Transfers with lenght greater than 0xffff are available only for DCMI with the `dcmi-giant-transfer` feature.")
+        } else {
+            unsafe { channel.start_read::<W>(request, reg_addr, buf, Default::default()) };
+        }
 
         Transfer::new(channel)
     }
@@ -232,7 +230,7 @@ mod transfers {
         buf: &'a [W],
         reg_addr: *mut W,
     ) -> impl Future<Output = ()> + 'a {
-        assert!(buf.len() > 0 && buf.len() <= 0xFFFF);
+        assert!(!buf.is_empty());
         into_ref!(channel);
 
         unsafe { channel.start_write::<W>(request, buf, reg_addr, Default::default()) };
