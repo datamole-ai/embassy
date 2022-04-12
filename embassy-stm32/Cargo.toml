@@ -101,6 +101,8 @@ nightly = ["embassy-executor/nightly", "embedded-hal-1", "embedded-hal-async", "
 # There are no plans to make this stable.
 unstable-pac = []
 
+dcmi-giant-transfer = []
+
 # Implement embedded-hal 1.0 alpha traits.
 # Implement embedded-hal-async traits if `nightly` is set as well.
 unstable-traits = ["embedded-hal-1", "dep:embedded-hal-nb"]

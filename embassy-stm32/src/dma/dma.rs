@@ -39,14 +39,117 @@ impl From<FlowControl> for vals::Pfctrl {
     }
 }
 
+#[cfg(feature = "dcmi-giant-transfer")]
+mod dcmi_giant_transfer {
+    use atomic_polyfill::Ordering;
+    use atomic_polyfill::{AtomicBool, AtomicU16, AtomicU32, AtomicU8};
+    pub struct M0AR(pub u32);
+    pub struct M1AR(pub u32);
+    pub struct ChunkSize(pub u16);
+    pub struct State {
+        enabled: AtomicBool,
+        data_address: AtomicU32,
+        remaining_chunks: AtomicU32,
+        chunk_size: AtomicU16,
+        transfer_len_bytes: AtomicU8,
+    }
+
+    impl State {
+        pub const fn new() -> Self {
+            Self {
+                enabled: AtomicBool::new(false),
+                data_address: AtomicU32::new(0),
+                remaining_chunks: AtomicU32::new(0),
+                chunk_size: AtomicU16::new(0),
+                transfer_len_bytes: AtomicU8::new(0),
+            }
+        }
+
+        pub fn enable(
+            &self,
+            data_addr: u32,
+            data_len: usize,
+            transfer_len_bytes: u8,
+        ) -> (M0AR, M1AR, ChunkSize) {
+            assert!(data_len % 2 == 0);
+            let chunk_estimate = data_len / 0xffff;
+
+            let mut chunks = chunk_estimate + 1;
+            while data_len % chunks != 0 {
+                chunks += 1;
+            }
+
+            let chunk_size = data_len / chunks;
+
+            let remaining_chunks = chunks - 2;
+
+            trace!("chunks: {}, chunk_size {}", chunks, chunk_size);
+
+            self.data_address.store(data_addr, Ordering::SeqCst);
+            self.chunk_size.store(chunk_size as u16, Ordering::SeqCst);
+            self.remaining_chunks
+                .store(remaining_chunks as u32, Ordering::SeqCst);
+            self.enabled.store(true, Ordering::SeqCst);
+            self.transfer_len_bytes
+                .store(transfer_len_bytes, Ordering::SeqCst);
+
+            (
+                M0AR(data_addr),
+                M1AR(data_addr + chunk_size as u32 * transfer_len_bytes as u32),
+                ChunkSize(chunk_size as u16),
+            )
+        }
+
+        pub fn disable(&self) {
+            self.enabled.store(false, Ordering::SeqCst);
+        }
+
+        pub fn is_enabled(&self) -> bool {
+            self.enabled.load(Ordering::SeqCst)
+        }
+
+        pub fn remaining_chunks(&self) -> u32 {
+            self.remaining_chunks.load(Ordering::SeqCst)
+        }
+
+        pub fn remaining_transfers(&self, ndtr: u32) -> u32 {
+            ndtr + self.remaining_chunks.load(Ordering::SeqCst) * self.chunk_size() as u32
+        }
+
+        pub fn chunk_size(&self) -> u16 {
+            self.chunk_size.load(Ordering::SeqCst)
+        }
+
+        pub fn transfer_len_bytes(&self) -> u8 {
+            self.transfer_len_bytes.load(Ordering::SeqCst)
+        }
+
+        pub fn next_chunk_addres(&self, prev_mem_ptr: u32) -> u32 {
+            prev_mem_ptr + 2 * self.chunk_size() as u32 * self.transfer_len_bytes() as u32
+        }
+
+        pub fn dequeue_next_chunk(&self, prev_mem_ptr: u32) -> u32 {
+            self.remaining_chunks.fetch_sub(1, Ordering::SeqCst);
+            self.next_chunk_addres(prev_mem_ptr)
+        }
+
+        pub fn data_address(&self) -> u32 {
+            self.data_address.load(Ordering::SeqCst)
+        }
+    }
+}
 struct ChannelState {
     waker: AtomicWaker,
+    #[cfg(feature = "dcmi-giant-transfer")]
+    giant_transfer_state: dcmi_giant_transfer::State,
 }
 
 impl ChannelState {
     const fn new() -> Self {
         Self {
             waker: AtomicWaker::new(),
+            #[cfg(feature = "dcmi-giant-transfer")]
+            giant_transfer_state: dcmi_giant_transfer::State::new(),
         }
     }
 }
@@ -84,6 +187,7 @@ foreach_dma_channel! {
                 low_level_api::start_transfer(
                     pac::$dma_peri,
                     $channel_num,
+                    $index,
                     request,
                     vals::Dir::MEMORYTOPERIPHERAL,
                     reg_addr as *const u32,
@@ -104,6 +208,7 @@ foreach_dma_channel! {
                 low_level_api::start_transfer(
                     pac::$dma_peri,
                     $channel_num,
+                    $index,
                     request,
                     vals::Dir::MEMORYTOPERIPHERAL,
                     reg_addr as *const u32,
@@ -121,9 +226,32 @@ foreach_dma_channel! {
 
             unsafe fn start_read<W: Word>(&mut self, request: Request, reg_addr: *const W, buf: *mut [W], options: TransferOptions) {
                 let (ptr, len) = super::slice_ptr_parts_mut(buf);
-                low_level_api::start_transfer(
+                    low_level_api::start_transfer(
+                        pac::$dma_peri,
+                        $channel_num,
+                        $index,
+                        request,
+                        vals::Dir::PERIPHERALTOMEMORY,
+                        reg_addr as *const u32,
+                        ptr as *mut u32,
+                        len,
+                        true,
+                        vals::Size::from(W::bits()),
+                        options,
+                        #[cfg(dmamux)]
+                        <Self as super::dmamux::sealed::MuxChannel>::DMAMUX_REGS,
+                        #[cfg(dmamux)]
+                        <Self as super::dmamux::sealed::MuxChannel>::DMAMUX_CH_NUM,
+                    );
+            }
+
+            #[cfg(feature = "dcmi-giant-transfer")]
+            unsafe fn start_giant_read<W: Word>(&mut self, request: Request, reg_addr: *const W, buf: *mut [W], options: TransferOptions) {
+                let (ptr, len) = super::slice_ptr_parts_mut(buf);
+                low_level_api::start_giant_transfer(
                     pac::$dma_peri,
                     $channel_num,
+                    $index,
                     request,
                     vals::Dir::PERIPHERALTOMEMORY,
                     reg_addr as *const u32,
@@ -139,56 +267,56 @@ foreach_dma_channel! {
                 );
             }
 
-            unsafe fn start_double_buffered_read<W: Word>(
-                &mut self,
-                request: Request,
-                reg_addr: *const W,
-                buffer0: *mut W,
-                buffer1: *mut W,
-                buffer_len: usize,
-                options: TransferOptions,
-            ) {
-                low_level_api::start_dbm_transfer(
-                    pac::$dma_peri,
-                    $channel_num,
-                    request,
-                    vals::Dir::PERIPHERALTOMEMORY,
-                    reg_addr as *const u32,
-                    buffer0 as *mut u32,
-                    buffer1 as *mut u32,
-                    buffer_len,
-                    true,
-                    vals::Size::from(W::bits()),
-                    options,
-                    #[cfg(dmamux)]
-                    <Self as super::dmamux::sealed::MuxChannel>::DMAMUX_REGS,
-                    #[cfg(dmamux)]
-                    <Self as super::dmamux::sealed::MuxChannel>::DMAMUX_CH_NUM,
-                );
-            }
+            // unsafe fn start_double_buffered_read<W: Word>(
+            //     &mut self,
+            //     request: Request,
+            //     reg_addr: *const W,
+            //     buffer0: *mut W,
+            //     buffer1: *mut W,
+            //     buffer_len: usize,
+            //     options: TransferOptions,
+            // ) {
+            //     low_level_api::start_dbm_transfer(
+            //         pac::$dma_peri,
+            //         $channel_num,
+            //         request,
+            //         vals::Dir::PERIPHERALTOMEMORY,
+            //         reg_addr as *const u32,
+            //         buffer0 as *mut u32,
+            //         buffer1 as *mut u32,
+            //         buffer_len,
+            //         true,
+            //         vals::Size::from(W::bits()),
+            //         options,
+            //         #[cfg(dmamux)]
+            //         <Self as super::dmamux::sealed::MuxChannel>::DMAMUX_REGS,
+            //         #[cfg(dmamux)]
+            //         <Self as super::dmamux::sealed::MuxChannel>::DMAMUX_CH_NUM,
+            //     );
+            // }
 
-            unsafe fn set_buffer0<W: Word>(&mut self, buffer: *mut W) {
-                low_level_api::set_dbm_buffer0(pac::$dma_peri, $channel_num, buffer as *mut u32);
-            }
+            // unsafe fn set_buffer0<W: Word>(&mut self, buffer: *mut W) {
+            //     low_level_api::set_dbm_buffer0(pac::$dma_peri, $channel_num, buffer as *mut u32);
+            // }
 
-            unsafe fn set_buffer1<W: Word>(&mut self, buffer: *mut W) {
-                low_level_api::set_dbm_buffer1(pac::$dma_peri, $channel_num, buffer as *mut u32);
-            }
+            // unsafe fn set_buffer1<W: Word>(&mut self, buffer: *mut W) {
+            //     low_level_api::set_dbm_buffer1(pac::$dma_peri, $channel_num, buffer as *mut u32);
+            // }
 
-            unsafe fn is_buffer0_accessible(&mut self) -> bool {
-                low_level_api::is_buffer0_accessible(pac::$dma_peri, $channel_num)
-            }
+            // unsafe fn is_buffer0_accessible(&mut self) -> bool {
+            //     low_level_api::is_buffer0_accessible(pac::$dma_peri, $channel_num)
+            // }
 
             fn request_stop(&mut self) {
-                unsafe {low_level_api::request_stop(pac::$dma_peri, $channel_num);}
+                unsafe {low_level_api::request_stop(pac::$dma_peri, $channel_num, $index);}
             }
 
             fn is_running(&self) -> bool {
                 unsafe {low_level_api::is_running(pac::$dma_peri, $channel_num)}
             }
 
-            fn remaining_transfers(&mut self) -> u16 {
-                unsafe {low_level_api::get_remaining_transfers(pac::$dma_peri, $channel_num)}
+            fn remaining_transfers(&mut self) -> u32 {
+                unsafe {low_level_api::get_remaining_transfers(pac::$dma_peri, $channel_num, $index)}
             }
 
             fn set_waker(&mut self, waker: &Waker) {
@@ -211,6 +339,7 @@ mod low_level_api {
     pub unsafe fn start_transfer(
         dma: pac::dma::Dma,
         channel_number: u8,
+        #[allow(unused)] state_index: usize,
         request: Request,
         dir: vals::Dir,
         peri_addr: *const u32,
@@ -229,6 +358,9 @@ mod low_level_api {
         fence(Ordering::SeqCst);
 
         reset_status(dma, channel_number);
+
+        #[cfg(feature = "dcmi-giant-transfer")]
+        STATE.channels[state_index].giant_transfer_state.disable();
 
         let ch = dma.st(channel_number as _);
         ch.par().write_value(peri_addr as u32);
@@ -261,14 +393,15 @@ mod low_level_api {
         });
     }
 
-    pub unsafe fn start_dbm_transfer(
+    #[cfg(feature = "dcmi-giant-transfer")]
+    pub unsafe fn start_giant_transfer(
         dma: pac::dma::Dma,
         channel_number: u8,
+        state_index: usize,
         request: Request,
         dir: vals::Dir,
         peri_addr: *const u32,
-        mem0_addr: *mut u32,
-        mem1_addr: *mut u32,
+        mem_addr: *mut u32,
         mem_len: usize,
         incr_mem: bool,
         data_size: vals::Size,
@@ -276,27 +409,36 @@ mod low_level_api {
         #[cfg(dmamux)] dmamux_regs: pac::dmamux::Dmamux,
         #[cfg(dmamux)] dmamux_ch_num: u8,
     ) {
+        assert!(mem_len > 0xffff);
+        assert!(mem_len % 2 == 0);
+
         #[cfg(dmamux)]
         super::super::dmamux::configure_dmamux(dmamux_regs, dmamux_ch_num, request);
-
-        trace!(
-            "Starting DBM transfer with 0: 0x{:x}, 1: 0x{:x}, len: 0x{:x}",
-            mem0_addr as u32,
-            mem1_addr as u32,
-            mem_len
-        );
 
         // "Preceding reads and writes cannot be moved past subsequent writes."
         fence(Ordering::SeqCst);
 
         reset_status(dma, channel_number);
 
+        let transfer_len_bytes = match data_size {
+            vals::Size::BITS8 => 1,
+            vals::Size::BITS16 => 2,
+            vals::Size::BITS32 => 4,
+            _ => panic!("Invalid data size."),
+        };
+
+        let (m0ar, m1ar, chunk_size) = STATE.channels[state_index].giant_transfer_state.enable(
+            mem_addr as u32,
+            mem_len,
+            transfer_len_bytes,
+        );
+
         let ch = dma.st(channel_number as _);
         ch.par().write_value(peri_addr as u32);
-        ch.m0ar().write_value(mem0_addr as u32);
+        ch.m0ar().write_value(m0ar.0);
         // configures the second buffer for DBM
-        ch.m1ar().write_value(mem1_addr as u32);
-        ch.ndtr().write_value(regs::Ndtr(mem_len as _));
+        ch.m1ar().write_value(m1ar.0);
+        ch.ndtr().write_value(regs::Ndtr(chunk_size.0 as _));
         ch.cr().write(|w| {
             w.set_dir(dir);
             w.set_msize(data_size);
@@ -328,29 +470,12 @@ mod low_level_api {
         });
     }
 
-    pub unsafe fn set_dbm_buffer0(dma: pac::dma::Dma, channel_number: u8, mem_addr: *mut u32) {
-        // get a handle on the channel itself
-        let ch = dma.st(channel_number as _);
-        // change M0AR to the new address
-        ch.m0ar().write_value(mem_addr as _);
-    }
-
-    pub unsafe fn set_dbm_buffer1(dma: pac::dma::Dma, channel_number: u8, mem_addr: *mut u32) {
-        // get a handle on the channel itself
-        let ch = dma.st(channel_number as _);
-        // change M1AR to the new address
-        ch.m1ar().write_value(mem_addr as _);
-    }
-
-    pub unsafe fn is_buffer0_accessible(dma: pac::dma::Dma, channel_number: u8) -> bool {
-        // get a handle on the channel itself
-        let ch = dma.st(channel_number as _);
-        // check the current target register value
-        ch.cr().read().ct() == vals::Ct::MEMORY1
-    }
-
     /// Stops the DMA channel.
-    pub unsafe fn request_stop(dma: pac::dma::Dma, channel_number: u8) {
+    pub unsafe fn request_stop(
+        dma: pac::dma::Dma,
+        channel_number: u8,
+        #[allow(unused)] state_index: usize,
+    ) {
         // get a handle on the channel itself
         let ch = dma.st(channel_number as _);
 
@@ -359,6 +484,9 @@ mod low_level_api {
             w.set_teie(true);
             w.set_tcie(true);
         });
+
+        #[cfg(feature = "dcmi-giant-transfer")]
+        STATE.channels[state_index].giant_transfer_state.disable();
 
         // "Subsequent reads and writes cannot be moved ahead of preceding reads."
         fence(Ordering::SeqCst);
@@ -374,11 +502,31 @@ mod low_level_api {
 
     /// Gets the total remaining transfers for the channel
     /// Note: this will be zero for transfers that completed without cancellation.
-    pub unsafe fn get_remaining_transfers(dma: pac::dma::Dma, ch: u8) -> u16 {
+    pub unsafe fn get_remaining_transfers(
+        dma: pac::dma::Dma,
+        ch: u8,
+        #[allow(unused)] state_index: usize,
+    ) -> u32 {
         // get a handle on the channel itself
         let ch = dma.st(ch as _);
         // read the remaining transfer count. If this is zero, the transfer completed fully.
-        ch.ndtr().read().ndt()
+        let ndtr = ch.ndtr().read().ndt() as u32;
+
+        #[cfg(feature = "dcmi-giant-transfer")]
+        {
+            if STATE.channels[state_index]
+                .giant_transfer_state
+                .is_enabled()
+            {
+                STATE.channels[state_index]
+                    .giant_transfer_state
+                    .remaining_transfers(ndtr)
+            } else {
+                ndtr
+            }
+        }
+        #[cfg(not(feature = "dcmi-giant-transfer"))]
+        ndtr
     }
 
     /// Sets the waker for the specified DMA channel
@@ -408,13 +556,69 @@ mod low_level_api {
             panic!("DMA: error on DMA@{:08x} channel {}", dma.0 as u32, channel_num);
         }
 
-        if isr.tcif(channel_num % 4) && cr.read().tcie() {
-            if cr.read().dbm() == vals::Dbm::DISABLED {
-                cr.write(|_| ()); // Disable channel with the default value.
-            } else {
-                // for double buffered mode, clear TCIF flag but do not stop the transfer
-                dma.ifcr(channel_num / 4).write(|w| w.set_tcif(channel_num % 4, true));
+        #[cfg(feature = "dcmi-giant-transfer")]
+        if STATE.channels[state_index]
+            .giant_transfer_state
+            .is_enabled()
+        {
+            if isr.tcif(channel_num % 4) && cr.read().tcie() {
+                dma.ifcr(channel_num / 4)
+                    .write(|w| w.set_tcif(channel_num % 4, true));
+
+                let remaining_transfers = STATE.channels[state_index]
+                    .giant_transfer_state
+                    .remaining_chunks();
+                defmt::trace!(
+                    "Giant DMA: {} remaining transfers {}",
+                    state_index,
+                    remaining_transfers
+                );
+                let current_target_memory1 = cr.read().ct() == vals::Ct::MEMORY1;
+                if remaining_transfers != 0 {
+                    if remaining_transfers % 2 == 0 && current_target_memory1 {
+                        // update pointer to memory 0
+                        let mem0_addr = dma.st(channel_num).m0ar().read();
+                        let new_addr = STATE.channels[state_index]
+                            .giant_transfer_state
+                            .dequeue_next_chunk(mem0_addr);
+                        dma.st(channel_num).m0ar().write_value(new_addr);
+                    } else if !current_target_memory1 {
+                        // update pointer to memory 1
+                        let mem1_addr = dma.st(channel_num).m1ar().read();
+                        let new_addr = STATE.channels[state_index]
+                            .giant_transfer_state
+                            .dequeue_next_chunk(mem1_addr);
+                        dma.st(channel_num).m1ar().write_value(new_addr);
+                    }
+                } else {
+                    if current_target_memory1 {
+                        dma.st(channel_num).m0ar().write_value(
+                            STATE.channels[state_index]
+                                .giant_transfer_state
+                                .data_address(),
+                        )
+                    } else {
+                        dma.st(channel_num).m1ar().write_value(
+                            STATE.channels[state_index]
+                                .giant_transfer_state
+                                .data_address(),
+                        )
+                    }
+                    // TCIF here means that Chunk N - 1 was transferred, the giant transfer is marked as finished
+                    // next TCIF will mean that all the data is transferred and will wake the future
+                    STATE.channels[state_index].giant_transfer_state.disable();
+                }
             }
+        } else {
+            if isr.tcif(channel_num % 4) && cr.read().tcie() {
+                cr.write(|_| ()); // Disable channel with the default value.
+                STATE.channels[state_index].waker.wake();
+            }
+        }
+
+        #[cfg(not(feature = "dcmi-giant-transfer"))]
+        if isr.tcif(channel_num % 4) && cr.read().tcie() {
+            cr.write(|_| ()); // Disable channel with the default value.
             STATE.channels[state_index].waker.wake();
         }
     }
