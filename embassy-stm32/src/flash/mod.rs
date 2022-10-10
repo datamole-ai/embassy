@@ -48,6 +48,7 @@ impl<'d> Flash<'d> {
 
         unsafe {
             family::unlock();
+            cortex_m::asm::delay(100);
             let res = family::blocking_write(offset, buf);
             family::lock();
             res
