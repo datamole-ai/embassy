@@ -50,6 +50,7 @@ pub fn run(args: syn::AttributeArgs, f: syn::ItemFn) -> Result<TokenStream, Toke
     ctxt.check()?;
 
     let task_ident = f.sig.ident.clone();
+    let size_report_string = "Spawning task ".to_string() + &task_ident.to_string() + " with size {}";
     let task_inner_ident = format_ident!("__{}_task", task_ident);
 
     let mut task_inner = f;
@@ -66,6 +67,7 @@ pub fn run(args: syn::AttributeArgs, f: syn::ItemFn) -> Result<TokenStream, Toke
 
         #visibility fn #task_ident(#fargs) -> ::embassy_executor::SpawnToken<impl Sized> {
             type Fut = impl ::core::future::Future + 'static;
+            defmt::warn!(#size_report_string, core::mem::size_of::<Fut>());
             static POOL: ::embassy_executor::raw::TaskPool<Fut, #pool_size> = ::embassy_executor::raw::TaskPool::new();
             unsafe { POOL._spawn_async_fn(move || #task_inner_ident(#(#arg_names,)*)) }
         }
