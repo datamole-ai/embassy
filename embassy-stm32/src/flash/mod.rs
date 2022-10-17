@@ -49,6 +49,8 @@ impl<'d> Flash<'d> {
         unsafe {
             family::unlock();
             cortex_m::asm::delay(100);
+            atomic_polyfill::fence(atomic_polyfill::Ordering::SeqCst);
+
             let res = family::blocking_write(offset, buf);
             family::lock();
             res
