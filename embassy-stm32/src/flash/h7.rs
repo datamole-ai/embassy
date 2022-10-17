@@ -15,6 +15,8 @@ pub(crate) unsafe fn lock() {
     if is_dual_bank() {
         pac::FLASH.bank(1).cr().modify(|w| w.set_lock(true));
     }
+    cortex_m::asm::isb();
+    cortex_m::asm::dsb();
 }
 
 pub(crate) unsafe fn unlock() {
@@ -25,6 +27,9 @@ pub(crate) unsafe fn unlock() {
         pac::FLASH.bank(1).keyr().write(|w| w.set_keyr(0x4567_0123));
         pac::FLASH.bank(1).keyr().write(|w| w.set_keyr(0xCDEF_89AB));
     }
+    cortex_m::asm::isb();
+    cortex_m::asm::dsb();
+    atomic_polyfill::fence(atomic_polyfill::Ordering::SeqCst);
 }
 
 pub(crate) unsafe fn blocking_write(offset: u32, buf: &[u8]) -> Result<(), Error> {
@@ -38,6 +43,10 @@ pub(crate) unsafe fn blocking_write(offset: u32, buf: &[u8]) -> Result<(), Error
         w.set_pg(true);
         w.set_psize(2); // 32 bits at once
     });
+
+    cortex_m::asm::isb();
+    cortex_m::asm::dsb();
+    atomic_polyfill::fence(atomic_polyfill::Ordering::SeqCst);
 
     let ret = {
         let mut ret: Result<(), Error> = Ok(());
@@ -63,6 +72,10 @@ pub(crate) unsafe fn blocking_write(offset: u32, buf: &[u8]) -> Result<(), Error
     };
 
     bank.cr().write(|w| w.set_pg(false));
+
+    cortex_m::asm::isb();
+    cortex_m::asm::dsb();
+    atomic_polyfill::fence(atomic_polyfill::Ordering::SeqCst);
 
     ret
 }
@@ -107,6 +120,10 @@ unsafe fn erase_sector(bank: pac::flash::Bank, sector: u8) -> Result<(), Error> 
     bank.cr().modify(|w| w.set_ser(false));
 
     bank_clear_all_err(bank);
+
+    cortex_m::asm::isb();
+    cortex_m::asm::dsb();
+    atomic_polyfill::fence(atomic_polyfill::Ordering::SeqCst);
 
     ret
 }
